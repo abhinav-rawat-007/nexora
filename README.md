@@ -16,6 +16,19 @@ A living-room home for your game library. Nexora syncs your games from Steam, Xb
 - **Rich cover art** — fetches box art via SteamGridDB.
 - **Fast, local, native** — a Rust backend with a SQLite-backed local database; no cloud account required.
 
+## Download
+
+Nexora ships as a native Windows installer — no build tools required.
+
+**[⬇ Download the latest release](https://github.com/abhinav-rawat-007/nexora/releases/latest)**
+
+Grab either installer from the release assets:
+
+- `Nexora_x64-setup.exe` — NSIS installer
+- `Nexora_x64_en-US.msi` — MSI installer
+
+Run it, follow the setup wizard, and launch Nexora from the Start menu.
+
 ## Tech stack
 
 - **Frontend** — React, TypeScript, Vite, Tailwind CSS, Framer Motion, Radix UI
@@ -23,7 +36,9 @@ A living-room home for your game library. Nexora syncs your games from Steam, Xb
 - **Storage** — SQLite (via `rusqlite`)
 - **Input** — `gilrs` for controllers, `hidapi` for raw HID device access
 
-## Getting started
+## Building from source
+
+Only needed if you want to hack on Nexora yourself.
 
 ### Prerequisites
 
@@ -32,25 +47,14 @@ A living-room home for your game library. Nexora syncs your games from Steam, Xb
 - [pnpm](https://pnpm.io/)
 - Windows (currently the only supported/tested platform)
 
-### Setup
+### Build the installer
 
 ```bash
 pnpm install
-```
-
-### Run in development
-
-```bash
-pnpm tauri dev
-```
-
-### Build a release executable
-
-```bash
 pnpm tauri build
 ```
 
-This produces a standalone executable and installers (MSI and NSIS) under `src-tauri/target/release/`.
+This produces a standalone `.exe` and installers (MSI and NSIS) under `src-tauri/target/release/`.
 
 ## Project structure
 
