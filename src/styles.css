@@ -1468,9 +1468,9 @@ textarea[aria-invalid="true"]:focus {
   width: min(520px, 100%);
   min-height: 218px;
   align-content: center;
-  padding: 24px;
+  padding: 32px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.07);
 }
 
@@ -1491,8 +1491,13 @@ textarea[aria-invalid="true"]:focus {
 .empty-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 18px;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.empty-actions button {
+  padding: 0 26px;
+  font-weight: 700;
 }
 
 .tile-skeleton {
