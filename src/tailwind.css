@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--nexora-font-mono);
+
+  --color-background: var(--nexora-bg);
+  --color-foreground: var(--nexora-fg);
+
+  --color-primary: var(--nexora-accent);
+  --color-primary-foreground: var(--nexora-bg-deep);
+
+  --color-secondary: var(--nexora-surface-solid);
+  --color-secondary-foreground: var(--nexora-fg);
+
+  --color-accent: var(--nexora-accent-deep);
+  --color-accent-foreground: var(--nexora-fg);
+
+  --color-muted: rgba(255, 255, 255, 0.08);
+  --color-muted-foreground: rgba(247, 251, 255, 0.6);
+
+  --color-card: var(--nexora-surface);
+  --color-card-foreground: var(--nexora-fg);
+
+  --color-popover: var(--nexora-surface);
+  --color-popover-foreground: var(--nexora-fg);
+
+  --color-border: var(--nexora-border);
+  --color-input: var(--nexora-border);
+  --color-ring: var(--nexora-accent);
+
+  --color-destructive: var(--nexora-danger);
+  --color-destructive-foreground: var(--nexora-fg);
+
+  --radius: var(--nexora-radius);
+  --radius-sm: calc(var(--nexora-radius) - 4px);
+  --radius-md: calc(var(--nexora-radius) - 2px);
+  --radius-lg: var(--nexora-radius);
+  --radius-xl: calc(var(--nexora-radius) + 4px);
+}
+
+/*
+ * Preflight is intentionally left enabled. styles.css is plain unlayered CSS while
+ * Tailwind's reset/utilities live inside its own cascade layers, so styles.css always
+ * wins ties against Tailwind by default - the legacy screens stay pixel-identical.
+ * The one place this flips against us is brand-new shadcn components (Settings):
+ * legacy's bare `button`/`input` element rules can still bleed onto them. If that
+ * shows up visually, prefer Tailwind's `!` important-modifier utilities on the
+ * specific shadcn component (e.g. `!bg-primary`) rather than touching styles.css.
+ */

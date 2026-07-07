@@ -1,0 +1,12 @@
+node_modules
+dist
+target
+.vite
+src-tauri/target
+src-tauri/gen
+*.log
+*.db
+*.sqlite*
+.env
+.env.*
+.claude

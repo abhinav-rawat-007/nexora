@@ -1,0 +1,37 @@
+[package]
+name = "nexora"
+version = "0.1.0"
+description = "Nexora game hub"
+authors = ["Nexora"]
+edition = "2021"
+
+[lib]
+name = "nexora_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+gilrs = "0.11"
+# Battery fallback for DualSense over Bluetooth: Windows binds the generic HID class driver to
+# it (no vendor driver, and Windows.Gaming.Input/gilrs don't recognize Sony pads), so gilrs'
+# power_info() always comes back Unknown there. hidapi lets us open the raw HID device by
+# VID/PID and read the battery byte straight out of its input report instead.
+hidapi = "2"
+# native-tls (Windows Schannel), not rustls-tls: SteamGridDB's edge silently serves its SPA
+# fallback page (HTTP 404, no JSON) to rustls' TLS handshake fingerprint, while curl and any
+# app using the OS's native TLS stack get a normal API response for the identical request.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.39.5", default-features = false, features = ["system"] }
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
