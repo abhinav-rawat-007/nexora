@@ -4,7 +4,7 @@ A living-room home for your game library. Nexora syncs your games from Steam, Xb
 
 ![platform](https://img.shields.io/badge/platform-Windows-0a84ff)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![status](https://img.shields.io/badge/status-v0.1.0-orange)
+![status](https://img.shields.io/badge/status-v0.2.0-orange)
 
 ## Features
 
