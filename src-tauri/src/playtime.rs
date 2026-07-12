@@ -109,7 +109,7 @@ fn end_session(
 /// needs the player to name anything. Prefers the game's own install folder (works even when the
 /// process Nexora spawned is a shared launcher stub elsewhere, e.g. Riot Client) and falls back to
 /// the directory of a direct exe launch when no install path was recorded.
-fn install_root(install_path: Option<&str>, exe_launch_target: Option<&str>) -> Option<PathBuf> {
+pub fn install_root(install_path: Option<&str>, exe_launch_target: Option<&str>) -> Option<PathBuf> {
   let install_path = install_path.map(str::trim).filter(|value| !value.is_empty());
   if let Some(install_path) = install_path {
     let path = Path::new(install_path);

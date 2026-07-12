@@ -72,12 +72,9 @@ pub fn fetch_artwork(api_key: &str, title: &str) -> Option<Artwork> {
   // then caches the 404 for that exact malformed path).
   let mut search_url = reqwest::Url::parse("https://www.steamgriddb.com/api/v2/search/autocomplete").ok()?;
   search_url.path_segments_mut().ok()?.push(title);
-  log(&format!(
-    "steamgriddb: requesting {} (key len={}, key prefix={:?})",
-    search_url,
-    api_key.len(),
-    api_key.chars().take(4).collect::<String>()
-  ));
+  // Deliberately nothing about the API key here - this log file is exactly what users get
+  // asked to share when reporting issues, so even a key prefix doesn't belong in it.
+  log(&format!("steamgriddb: requesting {search_url}"));
 
   let response = match client.get(search_url).bearer_auth(api_key).send() {
     Ok(response) => response,

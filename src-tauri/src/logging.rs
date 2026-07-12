@@ -16,6 +16,15 @@ pub fn init(app: &AppHandle) {
     return;
   }
   let path = dir.join("controller-debug.log");
+  // The file appends for the app's whole life and nothing else ever cleans it up; roll it
+  // aside once it gets big so long-lived installs don't accumulate an ever-growing log while
+  // still keeping one previous generation around for diagnostics.
+  const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+  if fs::metadata(&path).map(|meta| meta.len() > MAX_LOG_BYTES).unwrap_or(false) {
+    let rolled = dir.join("controller-debug.log.old");
+    let _ = fs::remove_file(&rolled);
+    let _ = fs::rename(&path, &rolled);
+  }
   if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
     let _ = LOG_FILE.set(Mutex::new(file));
     log(&format!("=== Nexora starting, logging controller diagnostics to {} ===", path.display()));

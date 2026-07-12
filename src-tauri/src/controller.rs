@@ -5,8 +5,9 @@ use std::{
   thread,
   time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
+use crate::db::read_settings;
 use crate::error::{NexoraError, Result};
 use crate::logging::log;
 use crate::models::{AppState, ControllerBatteryEvent, ControllerButtonEvent, ControllerConnectionEvent};
@@ -112,30 +113,44 @@ fn canonical_button(button: Button) -> Option<&'static str> {
   }
 }
 
-/// Deadzone (as a fraction of the axis's -1.0..1.0 range) below which left-stick movement
-/// is ignored. Chosen to match the frontend's default controller deadzone (55%, see
-/// `useGameControls`), so native and browser-driven navigation feel consistent.
-const STICK_DEADZONE: f32 = 0.5;
+/// Fallback stick deadzone (as a fraction of the axis's -1.0..1.0 range) when the user's
+/// "controllerDeadzone" setting can't be read - matches its seeded default (55%), so native
+/// and browser-driven navigation feel consistent.
+const DEFAULT_STICK_DEADZONE: f32 = 0.55;
+
+/// The user's configured stick deadzone (Settings > Controller, stored as a 0-100 percent
+/// string), as the 0-1 fraction `stick_direction` compares against. Clamped so a bad value
+/// can't make the stick fire constantly (0) or never (1).
+fn read_stick_deadzone(state: &AppState) -> f32 {
+  let Ok(db) = state.db.lock() else { return DEFAULT_STICK_DEADZONE };
+  let Ok(settings) = read_settings(&db) else { return DEFAULT_STICK_DEADZONE };
+  settings
+    .controller_deadzone
+    .trim()
+    .parse::<f32>()
+    .map(|percent| (percent / 100.0).clamp(0.1, 0.95))
+    .unwrap_or(DEFAULT_STICK_DEADZONE)
+}
 
 /// Collapses the left stick's (x, y) position into a single D-pad-style direction, so stick
 /// navigation can be emitted through the same "controller-button" channel the physical D-pad
 /// uses. The larger-magnitude axis wins to avoid firing two directions on a diagonal push.
 /// gilrs reports up as a positive Y value on Windows (raw XInput sThumbLY is unmodified).
-fn stick_direction(x: f32, y: f32) -> Option<&'static str> {
-  if x.abs() < STICK_DEADZONE && y.abs() < STICK_DEADZONE {
+fn stick_direction(x: f32, y: f32, deadzone: f32) -> Option<&'static str> {
+  if x.abs() < deadzone && y.abs() < deadzone {
     return None;
   }
   if x.abs() >= y.abs() {
-    if x > STICK_DEADZONE {
+    if x > deadzone {
       Some("DPadRight")
-    } else if x < -STICK_DEADZONE {
+    } else if x < -deadzone {
       Some("DPadLeft")
     } else {
       None
     }
-  } else if y > STICK_DEADZONE {
+  } else if y > deadzone {
     Some("DPadUp")
-  } else if y < -STICK_DEADZONE {
+  } else if y < -deadzone {
     Some("DPadDown")
   } else {
     None
@@ -144,6 +159,9 @@ fn stick_direction(x: f32, y: f32) -> Option<&'static str> {
 
 pub fn start_controller_thread(app: AppHandle, gilrs: Arc<Mutex<Gilrs>>) {
   thread::spawn(move || {
+    // AppState is managed before this thread starts (see lib.rs setup); try_state keeps a
+    // future ordering change from panicking the whole thread over a missing deadzone source.
+    let state: Option<AppState> = app.try_state::<AppState>().map(|state| state.inner().clone());
     if let Ok(gilrs) = gilrs.lock() {
       let seen: Vec<String> = gilrs.gamepads().map(|(_, pad)| pad.name().to_string()).collect();
       log(&format!("gilrs sees {} gamepad(s) at startup: {:?}", seen.len(), seen));
@@ -159,6 +177,11 @@ pub fn start_controller_thread(app: AppHandle, gilrs: Arc<Mutex<Gilrs>>) {
     let mut stick_x = 0f32;
     let mut stick_y = 0f32;
     let mut stick_dir: Option<&'static str> = None;
+    // Re-read the user's deadzone setting on a timer (not per axis event - that would hit the
+    // DB hundreds of times a second while the stick moves) so Settings changes apply without
+    // an app restart.
+    let mut deadzone = state.as_ref().map(read_stick_deadzone).unwrap_or(DEFAULT_STICK_DEADZONE);
+    let mut last_deadzone_check = Instant::now();
     // Battery level changes slowly - poll it on a timer instead of on every event/tick, since
     // each check is a real WinRT call (TryGetBatteryReport), not a free read.
     let mut last_battery_check = Instant::now();
@@ -178,7 +201,17 @@ pub fn start_controller_thread(app: AppHandle, gilrs: Arc<Mutex<Gilrs>>) {
         pending
       };
 
-      if last_heartbeat.elapsed() > Duration::from_secs(2) {
+      if last_deadzone_check.elapsed() > Duration::from_secs(3) {
+        last_deadzone_check = Instant::now();
+        if let Some(state) = &state {
+          deadzone = read_stick_deadzone(state);
+        }
+      }
+
+      // 30s is frequent enough to bracket a controller "dying" in-game for diagnostics without
+      // flooding the log - at the previous 2s cadence this single line was ~40k lines per day
+      // of the log file's growth.
+      if last_heartbeat.elapsed() > Duration::from_secs(30) {
         last_heartbeat = Instant::now();
         if let Ok(gilrs) = gilrs.lock() {
           let seen: Vec<(String, bool)> = gilrs
@@ -226,7 +259,7 @@ pub fn start_controller_thread(app: AppHandle, gilrs: Arc<Mutex<Gilrs>>) {
           }
           EventType::AxisChanged(Axis::LeftStickX, value, _) => {
             stick_x = value;
-            let dir = stick_direction(stick_x, stick_y);
+            let dir = stick_direction(stick_x, stick_y, deadzone);
             if dir != stick_dir {
               stick_dir = dir;
               if let Some(button) = dir {
@@ -239,7 +272,7 @@ pub fn start_controller_thread(app: AppHandle, gilrs: Arc<Mutex<Gilrs>>) {
           }
           EventType::AxisChanged(Axis::LeftStickY, value, _) => {
             stick_y = value;
-            let dir = stick_direction(stick_x, stick_y);
+            let dir = stick_direction(stick_x, stick_y, deadzone);
             if dir != stick_dir {
               stick_dir = dir;
               if let Some(button) = dir {

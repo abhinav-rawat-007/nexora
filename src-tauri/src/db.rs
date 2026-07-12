@@ -94,6 +94,7 @@ pub fn list_games(db: &Connection) -> Result<Vec<Game>> {
       launch_args, hero_image, cover_image, header_image, description, last_played_at, playtime_minutes, is_installed,
       developers, genres, release_date, is_favorite
      from games
+     where is_installed = 1
      order by case when sort_order is null then 1 else 0 end, sort_order, lower(title)",
   )?;
   let rows = stmt.query_map([], map_game)?;
@@ -154,12 +155,17 @@ pub fn set_favorite(db: &Connection, id: &str, favorite: bool) -> Result<Game> {
 /// order, so each id's index becomes its `sort_order`. Games left out (shouldn't normally happen,
 /// since the frontend always sends its full library array) keep whatever order they already had.
 pub fn set_game_order(db: &Connection, game_ids: &[String]) -> Result<Vec<Game>> {
+  // One transaction instead of one implicit commit (and fsync) per game - a reorder of a large
+  // library is otherwise hundreds of disk syncs, and a crash mid-loop can't leave a half-applied
+  // order.
+  let tx = db.unchecked_transaction()?;
   for (index, id) in game_ids.iter().enumerate() {
-    db.execute(
+    tx.execute(
       "update games set sort_order = ?2, updated_at = datetime('now') where id = ?1",
       params![id, index as i64],
     )?;
   }
+  tx.commit()?;
   list_games(db)
 }
 
@@ -299,19 +305,24 @@ pub fn delete_synced_game(db: &Connection, source: &str, source_game_id: &str) -
   Ok(())
 }
 
-/// For launchers that don't need Steam's fine-grained "not a game" detection: whatever the
-/// detector found this run *is* the truth for that source, so anything else previously
-/// stored under it must have been uninstalled/renamed and should be dropped.
+/// Whatever the detector found this run *is* the truth for a source, so anything else
+/// previously stored under it was uninstalled/renamed. Rows are soft-hidden
+/// (`is_installed = 0`, filtered out by `list_games`) rather than deleted, so the player's
+/// state on them - favorite flag, custom sort position, Nexora-tracked playtime - survives a
+/// reinstall: the next sync's upsert flips the same row back to `is_installed = 1`.
 pub fn reconcile_source(db: &Connection, source: &str, seen_ids: &[String]) -> Result<()> {
   let seen: std::collections::HashSet<&String> = seen_ids.iter().collect();
-  let mut stmt = db.prepare("select source_game_id from games where source = ?1")?;
+  let mut stmt = db.prepare("select source_game_id from games where source = ?1 and is_installed = 1")?;
   let existing: Vec<String> = stmt
     .query_map(params![source], |row| row.get::<_, Option<String>>(0))?
     .filter_map(|value| value.ok().flatten())
     .collect();
   for id in existing {
     if !seen.contains(&id) {
-      delete_synced_game(db, source, &id)?;
+      db.execute(
+        "update games set is_installed = 0, updated_at = datetime('now') where source = ?1 and source_game_id = ?2",
+        params![source, id],
+      )?;
     }
   }
   Ok(())

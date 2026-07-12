@@ -104,7 +104,17 @@ pub fn fetch_steam_details_bulk(
         scope.spawn(move || {
           chunk
             .iter()
-            .map(|appid| ((*appid).clone(), fetch_steam_details(appid)))
+            .enumerate()
+            .map(|(index, appid)| {
+              // The store's appdetails endpoint rate-limits per IP (roughly a couple hundred
+              // requests per few minutes) and has no batch form. Spacing each worker's requests
+              // out keeps a large first sync from tripping the limit all at once; a tripped
+              // limit isn't fatal (it surfaces as Err and retries next sync) but wastes the run.
+              if index > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+              }
+              ((*appid).clone(), fetch_steam_details(appid))
+            })
             .collect::<Vec<_>>()
         })
       })
@@ -201,20 +211,28 @@ pub fn ensure_steam_running() -> Result<()> {
   Err(NexoraError::Message("Timed out waiting for Steam to start.".into()))
 }
 
-pub fn discover_steam_libraries(steam_path: &Path) -> Vec<PathBuf> {
+/// Returns the discovered library folders alongside whether every folder Steam's own
+/// `libraryfolders.vdf` lists was actually reachable on disk - false if any (e.g. an external
+/// drive) was missing, so callers can tell "no games here" apart from "couldn't check here".
+pub fn discover_steam_libraries(steam_path: &Path) -> (Vec<PathBuf>, bool) {
   let mut libraries = vec![steam_path.to_path_buf()];
+  let mut all_reachable = true;
   let library_file = steam_path.join("steamapps").join("libraryfolders.vdf");
   let Ok(content) = fs::read_to_string(library_file) else {
-    return libraries;
+    return (libraries, all_reachable);
   };
 
   for value in parse_vdf_values(&content, "path") {
     let path = PathBuf::from(value.replace("\\\\", "\\"));
-    if path.exists() && !libraries.contains(&path) {
+    if !path.exists() {
+      all_reachable = false;
+      continue;
+    }
+    if !libraries.contains(&path) {
       libraries.push(path);
     }
   }
-  libraries
+  (libraries, all_reachable)
 }
 
 /// Steam app types that are installed alongside real games (redistributables, tools,
@@ -242,28 +260,38 @@ fn find_appid_by_title(title: &str) -> Option<String> {
     .and_then(|items| items.as_array())
     .and_then(|items| items.first())
     .and_then(|item| item.get("id"))
-    .map(|id| id.to_string())
+    // The id arrives as a JSON number today; going through as_u64/as_str (instead of
+    // Value::to_string, which would wrap a string id in literal quotes) keeps it correct
+    // if the API ever switches representation.
+    .and_then(|id| id.as_u64().map(|id| id.to_string()).or_else(|| id.as_str().map(str::to_string)))
 }
 
-/// Returns `Ok(None)` when the Steam store confirms this app is not a launchable game
-/// (no store page, or a known non-game type), `Ok(Some(details))` for a real game, and
-/// `Err` only on network/parse failure so an offline sync doesn't wrongly drop real games.
+/// Returns `Ok(None)` only when the store *positively confirms* this app is not a launchable
+/// game: a real store entry (`success: true`) whose type is a known non-game. A bare
+/// `success: false` is not that confirmation - the store also answers that for delisted games
+/// (still installed and perfectly playable), region-locked titles, and while rate-limiting -
+/// so it comes back as `Err` like a network failure: the caller keeps the game and retries
+/// details on a later sync instead of deleting it.
 fn fetch_steam_details(appid: &str) -> Result<Option<SteamDetails>> {
   let url = format!("https://store.steampowered.com/api/appdetails?appids={}&filters=basic", appid);
   let client = reqwest::blocking::Client::builder()
     .timeout(Duration::from_secs(5))
     .build()?;
-  let value: Value = client.get(url).send()?.json()?;
+  let response = client.get(url).send()?;
+  if !response.status().is_success() {
+    return Err(NexoraError::Message(format!("Steam store returned {} for appid {appid}", response.status())));
+  }
+  let value: Value = response.json()?;
   let entry = value.get(appid);
   let success = entry
     .and_then(|entry| entry.get("success"))
     .and_then(|value| value.as_bool())
     .unwrap_or(false);
-  if !success {
-    return Ok(None);
-  }
-  let Some(data) = entry.and_then(|entry| entry.get("data")) else {
-    return Ok(None);
+  let data = entry.and_then(|entry| entry.get("data"));
+  let (true, Some(data)) = (success, data) else {
+    return Err(NexoraError::Message(format!(
+      "Steam store had no details for appid {appid} (delisted, region-locked, or rate-limited)"
+    )));
   };
   let app_type = data.get("type").and_then(|value| value.as_str()).unwrap_or("game").to_lowercase();
   if NON_GAME_APP_TYPES.contains(&app_type.as_str()) {

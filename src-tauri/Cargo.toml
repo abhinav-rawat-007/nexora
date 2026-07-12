@@ -1,6 +1,6 @@
 [package]
 name = "nexora"
-version = "0.1.0"
+version = "0.2.0"
 description = "Nexora game hub"
 authors = ["Nexora"]
 edition = "2021"

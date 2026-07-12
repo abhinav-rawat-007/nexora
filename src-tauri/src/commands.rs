@@ -1,7 +1,7 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
-use std::{fs, path::Path, process::Command};
+use std::{fs, process::Command};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tauri::State;
@@ -24,7 +24,7 @@ use crate::models::{
   AppSettings, AppState, Game, GameMetadataLookup, ManualGamePayload, SourceSyncSummary, SteamDetails, SyncResult,
   SyncedGame,
 };
-use crate::playtime::{track_launch, ActiveSession};
+use crate::playtime::{install_root, track_launch, ActiveSession};
 use crate::riot::discover_riot_games;
 use crate::steam::{
   build_steam_game, discover_steam, discover_steam_libraries, ensure_steam_running,
@@ -52,9 +52,13 @@ fn lock_db(db: &Arc<Mutex<Connection>>) -> Result<std::sync::MutexGuard<'_, Conn
 /// so a sync no longer holds up every other command for its full duration.
 fn sync_steam(db: &Arc<Mutex<Connection>>) -> Result<usize> {
   let steam = discover_steam()?;
-  let libraries = discover_steam_libraries(&steam);
+  let (libraries, all_libraries_reachable) = discover_steam_libraries(&steam);
   let playtimes = read_steam_playtimes(&steam);
 
+  // Reconciling (pruning DB rows not seen this run) is only safe when this scan provably saw
+  // everything: an unreachable library folder or a manifest we failed to read both mean a game
+  // could exist without appearing in `locals`, and pruning then would wrongly delete it.
+  let mut scan_complete = all_libraries_reachable;
   let mut locals = Vec::new();
   for library in libraries {
     let steamapps = library.join("steamapps");
@@ -62,8 +66,23 @@ fn sync_steam(db: &Arc<Mutex<Connection>>) -> Result<usize> {
       continue;
     }
 
-    for entry in fs::read_dir(&steamapps)? {
-      let entry = entry?;
+    let entries = match fs::read_dir(&steamapps) {
+      Ok(entries) => entries,
+      Err(err) => {
+        log(&format!("sync_steam: failed to read {}: {err}", steamapps.display()));
+        scan_complete = false;
+        continue;
+      }
+    };
+    for entry in entries {
+      let entry = match entry {
+        Ok(entry) => entry,
+        Err(err) => {
+          log(&format!("sync_steam: failed to read an entry in {}: {err}", steamapps.display()));
+          scan_complete = false;
+          continue;
+        }
+      };
       let path = entry.path();
       let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         continue;
@@ -71,8 +90,13 @@ fn sync_steam(db: &Arc<Mutex<Connection>>) -> Result<usize> {
       if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
         continue;
       }
-      if let Some(local) = parse_local_manifest(&path, &steamapps, &playtimes)? {
-        locals.push(local);
+      match parse_local_manifest(&path, &steamapps, &playtimes) {
+        Ok(Some(local)) => locals.push(local),
+        Ok(None) => {}
+        Err(err) => {
+          log(&format!("sync_steam: failed to parse {}: {err:?}", path.display()));
+          scan_complete = false;
+        }
       }
     }
   }
@@ -85,6 +109,9 @@ fn sync_steam(db: &Arc<Mutex<Connection>>) -> Result<usize> {
   let fetched = fetch_steam_details_bulk(&appids, &cached);
 
   let conn = lock_db(db)?;
+  // One transaction for the whole write phase: a large library otherwise pays one implicit
+  // transaction (and fsync) per game, and a crash mid-sync can't leave a half-applied library.
+  let tx = conn.unchecked_transaction()?;
   let mut imported = 0;
   for local in locals {
     // `details_synced_at` only advances when this run actually confirmed details against the
@@ -93,17 +120,29 @@ fn sync_steam(db: &Arc<Mutex<Connection>>) -> Result<usize> {
     // instead of being treated as freshly checked.
     let (details, details_synced_at) = match fetched.get(&local.appid) {
       Some(Ok(Some(details))) => (details.clone(), Some(Utc::now().to_rfc3339())),
+      // The store positively confirmed this appid is not a launchable game (tool, DLC,
+      // soundtrack, ...) - the one case where dropping the row outright is correct. Failed or
+      // inconclusive lookups come back as `Err` instead and keep the game (see
+      // `fetch_steam_details`).
       Some(Ok(None)) => {
-        delete_synced_game(&conn, "steam", &local.appid)?;
+        delete_synced_game(&tx, "steam", &local.appid)?;
         continue;
       }
       Some(Err(_)) => (SteamDetails::default(), None),
       // Not in `fetched` means it was already cached from a previous sync - reuse it as-is.
       None => (cached.get(&local.appid).cloned().unwrap_or_default(), None),
     };
-    upsert_synced_game(&conn, "steam", SyncedGame::from(build_steam_game(local, details, details_synced_at)))?;
+    upsert_synced_game(&tx, "steam", SyncedGame::from(build_steam_game(local, details, details_synced_at)))?;
     imported += 1;
   }
+
+  // Only prune games missing from this run when the scan saw every library folder and manifest -
+  // otherwise an unmounted external drive (or one unreadable file) would look identical to an
+  // uninstall and wipe games that are still there.
+  if scan_complete {
+    reconcile_source(&tx, "steam", &appids)?;
+  }
+  tx.commit()?;
 
   Ok(imported)
 }
@@ -125,6 +164,7 @@ fn sync_simple_source(db: &Arc<Mutex<Connection>>, source: &str, games: Vec<Sync
   let artwork = fetch_artwork_bulk(api_key, &titles);
 
   let conn = lock_db(db)?;
+  let tx = conn.unchecked_transaction()?;
   for mut game in games {
     if game.cover_image.is_none() && game.hero_image.is_none() {
       if let Some(Some(artwork)) = artwork.get(&game.title) {
@@ -133,18 +173,18 @@ fn sync_simple_source(db: &Arc<Mutex<Connection>>, source: &str, games: Vec<Sync
         game.header_image = artwork.hero_image.clone();
       }
     }
-    upsert_synced_game(&conn, source, game)?;
+    upsert_synced_game(&tx, source, game)?;
   }
-  reconcile_source(&conn, source, &seen_ids)?;
+  reconcile_source(&tx, source, &seen_ids)?;
+  tx.commit()?;
   Ok(imported)
 }
 
 #[tauri::command]
 pub fn sync_steam_library(state: State<AppState>) -> Result<Vec<Game>> {
-  let imported = sync_steam(&state.db)?;
-  if imported == 0 {
-    return Err(NexoraError::Message("Steam was found, but no installed games were imported.".into()));
-  }
+  // Zero installed games is a legitimate outcome (fresh Steam install, or the user uninstalled
+  // everything), not a failure - only Steam itself being missing errors (via discover_steam).
+  sync_steam(&state.db)?;
   let conn = lock_db(&state.db)?;
   list_games(&conn)
 }
@@ -345,10 +385,35 @@ pub fn set_game_order(state: State<AppState>, game_ids: Vec<String>) -> Result<V
   crate::db::set_game_order(&db, &game_ids)
 }
 
+/// `cmd /C start` re-parses its entire command line, so a launch target containing cmd
+/// metacharacters could break out of the URI and run arbitrary commands. Targets come from
+/// launcher manifests and the DB, not the player's keyboard, so be strict rather than clever:
+/// require a scheme-shaped prefix (letter first, a ':' present) and reject every character cmd
+/// could reinterpret - quotes, '%' (variable expansion happens even inside quotes), the
+/// redirection/chaining set, and whitespace/control characters. Real launch URIs
+/// (steam://run/1, com.epicgames.launcher://apps/...?action=launch, shell:appsFolder\X!Y)
+/// contain none of these.
+fn is_launchable_uri(target: &str) -> bool {
+  if !target.chars().next().is_some_and(|first| first.is_ascii_alphabetic()) {
+    return false;
+  }
+  if !target.contains(':') {
+    return false;
+  }
+  target
+    .chars()
+    .all(|ch| !matches!(ch, '"' | '%' | '&' | '|' | '^' | '<' | '>') && !ch.is_whitespace() && !ch.is_control())
+}
+
 #[tauri::command]
 pub fn launch_game(state: State<AppState>, app: tauri::AppHandle, game_id: String) -> Result<()> {
-  let db = state.db.lock().map_err(|_| NexoraError::Message("Database lock failed".into()))?;
-  let game = get_game(&db, &game_id)?;
+  // Read what's needed and release the lock before launching: ensure_steam_running below can
+  // legitimately block for many seconds waiting for Steam to boot, and holding the DB mutex
+  // through that would freeze every other command (game list, settings, session polling).
+  let game = {
+    let db = lock_db(&state.db)?;
+    get_game(&db, &game_id)?
+  };
   log(&format!(
     "launch_game: id={} title={:?} launch_type={} target={:?}",
     game_id, game.title, game.launch_type, game.launch_target
@@ -359,6 +424,10 @@ pub fn launch_game(state: State<AppState>, app: tauri::AppHandle, game_id: Strin
     // shell:appsFolder\...) the same way "steam_uri" already does - `cmd /C start` opens any
     // of them identically, so no per-launcher branch is needed here.
     "steam_uri" | "uri" => {
+      if !is_launchable_uri(&game.launch_target) {
+        log(&format!("launch_game: rejected unsafe launch target {:?}", game.launch_target));
+        return Err(NexoraError::Message("This game's launch link is not a valid URI.".into()));
+      }
       if game.launch_type == "steam_uri" {
         // Firing steam://run/<appid> while Steam is closed does start Steam, but Windows can
         // drop the pending run request if it arrives before Steam's protocol handler is ready,
@@ -369,9 +438,16 @@ pub fn launch_game(state: State<AppState>, app: tauri::AppHandle, game_id: Strin
         }
       }
       let mut command = Command::new("cmd");
-      command.args(["/C", "start", "", &game.launch_target]);
       #[cfg(windows)]
-      command.creation_flags(CREATE_NO_WINDOW);
+      {
+        // Built as one raw string (not .args) because Rust's per-argument quoting follows
+        // CreateProcess rules, not cmd's - the validated target is wrapped in plain quotes,
+        // which is exactly what cmd expects. is_launchable_uri guarantees no embedded quotes.
+        command.raw_arg(format!("/C start \"\" \"{}\"", game.launch_target));
+        command.creation_flags(CREATE_NO_WINDOW);
+      }
+      #[cfg(not(windows))]
+      command.args(["/C", "start", "", &game.launch_target]);
       match command.spawn() {
         // This "cmd /C start" shim exits the instant it hands off to the real launcher/game, so
         // its child handle is useless for playtime (see playtime::track_launch, which finds the
@@ -393,11 +469,12 @@ pub fn launch_game(state: State<AppState>, app: tauri::AppHandle, game_id: Strin
           command.arg(arg);
         }
       }
-      if let Some(install_path) = &game.install_path {
-        let path = Path::new(install_path);
-        if let Some(parent) = path.parent() {
-          command.current_dir(parent);
-        }
+      // install_root handles install_path being either the game's folder or (for manual games
+      // typed rather than browsed) the exe itself - naively taking .parent() of a folder-style
+      // path pointed the working directory one level above the game, breaking titles that load
+      // assets relative to their cwd.
+      if let Some(dir) = install_root(game.install_path.as_deref(), Some(&game.launch_target)) {
+        command.current_dir(dir);
       }
       #[cfg(windows)]
       command.creation_flags(CREATE_NO_WINDOW);
@@ -414,11 +491,13 @@ pub fn launch_game(state: State<AppState>, app: tauri::AppHandle, game_id: Strin
     }
     _ => return Err(NexoraError::Message("Unknown launch type.".into())),
   };
-  db.execute(
-    "update games set last_played_at = ?2, updated_at = datetime('now') where id = ?1",
-    params![game_id, Utc::now().to_rfc3339()],
-  )?;
-  drop(db);
+  {
+    let db = lock_db(&state.db)?;
+    db.execute(
+      "update games set last_played_at = ?2, updated_at = datetime('now') where id = ?1",
+      params![game_id, Utc::now().to_rfc3339()],
+    )?;
+  }
 
   // Every source gets the live "Playing" indicator via the same automatic detection (see
   // playtime::track_launch). Steam is the one exception for the playtime *number* itself: it
